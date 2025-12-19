@@ -328,9 +328,9 @@ def evaluate_model(model, X_train, y_train, X_test, y_test, scaler, scaled_featu
 # ============================================================================
 # FUNCTION: Forecast future prices
 # ============================================================================
-def future_forecast(model, data, scaler, scaled_features, seq_len, n_days):
+def future_forecast(model, data, scaler, scaled_features, seq_len, n_days, heston_params):
     """
-    Perform auto-regressive forecasting for future days.
+    Perform auto-regressive forecasting for future days with proper Heston volatility simulation.
     
     Args:
         model: Trained GRU model
@@ -339,43 +339,66 @@ def future_forecast(model, data, scaler, scaled_features, seq_len, n_days):
         scaled_features: Scaled historical features
         seq_len: Sequence length
         n_days: Number of days to forecast
+        heston_params: Dictionary of Heston model parameters
     
     Returns:
-        tuple: (future dates, future prices)
+        tuple: (future dates, future prices, future volatilities)
     """
+    # Extract Heston parameters
+    kappa = heston_params['kappa']
+    theta = heston_params['theta']
+    sigma_v = heston_params['sigma_v']
+    v0 = heston_params['v0']
+    dt = 1/252
+    
     # Start with the last sequence
     last_sequence = scaled_features[-seq_len:].copy()
     future_predictions = []
+    future_volatilities = []
     
-    # Auto-regressive forecasting
-    for _ in range(n_days):
+    # Initialize volatility state (start from last known variance)
+    v_current = data['Volatility'].iloc[-1] ** 2  # Convert volatility to variance
+    
+    # Auto-regressive forecasting with Heston volatility simulation
+    for day in range(n_days):
         # Reshape for prediction
         input_seq = last_sequence.reshape(1, seq_len, scaled_features.shape[1])
         
         # Predict next price (scaled)
         next_pred_scaled = model.predict(input_seq, verbose=0)[0, 0]
         
-        # Assume volatility remains constant (use last known volatility)
-        next_vol_scaled = last_sequence[-1, 1]
+        # Simulate next Heston volatility (Euler-Maruyama discretization)
+        dv = kappa * (theta - v_current) * dt + sigma_v * np.sqrt(max(v_current, 1e-8)) * np.random.normal() * np.sqrt(dt)
+        v_current = max(v_current + dv, 1e-8)  # Ensure positive variance
+        next_vol = np.sqrt(v_current)  # Convert variance back to volatility
         
-        # Create next step
+        # Store the actual volatility before scaling
+        future_volatilities.append(next_vol)
+        
+        # Scale the volatility for model input
+        # We need to scale it the same way as during training
+        temp_features = np.array([[0, next_vol]])  # Dummy price, real volatility
+        scaled_temp = scaler.transform(temp_features)
+        next_vol_scaled = scaled_temp[0, 1]
+        
+        # Create next step with predicted price and simulated volatility
         next_step = np.array([[next_pred_scaled, next_vol_scaled]])
         
-        # Update sequence
+        # Update sequence (slide window)
         last_sequence = np.vstack([last_sequence[1:], next_step])
         
         # Store prediction
         future_predictions.append(next_step[0])
     
-    # Convert to array and inverse transform
+    # Convert to array and inverse transform to get actual prices
     future_predictions = np.array(future_predictions)
     future_prices = scaler.inverse_transform(future_predictions)[:, 0]
     
-    # Generate future dates
+    # Generate future dates (business days)
     last_date = data.index[-1]
     future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=n_days, freq='D')
     
-    return future_dates, future_prices
+    return future_dates, future_prices, future_volatilities
 
 # ============================================================================
 # STREAMLIT APPLICATION
@@ -573,16 +596,41 @@ def main():
             # Step 7: Future forecasting
             status_text.text(f"🔮 Forecasting {n_days} days into the future...")
             progress_bar.progress(90)
-            future_dates, future_prices = future_forecast(model, data, scaler, scaled_features, seq_len, n_days)
+            future_dates, future_prices, future_vols = future_forecast(
+                model, data, scaler, scaled_features, seq_len, n_days, heston_params
+            )
             
             st.markdown(f"## 🔮 Future Price Forecast ({n_days} Days)")
+            
+            # Add warning for long-term predictions
+            if n_days > 30:
+                st.warning("⚠️ **Warning:** Predictions beyond 30 days may be unreliable due to error amplification in autoregressive forecasting. Consider using shorter horizons (7-21 days) for more accurate results.")
+            
+            # Calculate prediction statistics
+            avg_future_price = np.mean(future_prices)
+            std_future_price = np.std(future_prices)
+            min_future_price = np.min(future_prices)
+            max_future_price = np.max(future_prices)
             
             # Display future predictions
             future_df = pd.DataFrame({
                 'Date': future_dates,
-                'Predicted Price': future_prices
+                'Predicted Price': future_prices,
+                'Forecasted Volatility': future_vols
             })
             st.dataframe(future_df, use_container_width=True)
+            
+            # Summary statistics for forecast
+            st.markdown("### Forecast Summary Statistics")
+            col_a, col_b, col_c, col_d = st.columns(4)
+            with col_a:
+                st.metric("Average Price", f"${avg_future_price:.2f}")
+            with col_b:
+                st.metric("Std Deviation", f"${std_future_price:.2f}")
+            with col_c:
+                st.metric("Min Price", f"${min_future_price:.2f}")
+            with col_d:
+                st.metric("Max Price", f"${max_future_price:.2f}")
             
             # Plot future predictions
             st.markdown("### Future Price Forecast Chart")
@@ -590,20 +638,27 @@ def main():
             
             # Plot historical prices (last 180 days for clarity)
             recent_data = data.tail(180)
-            ax4.plot(recent_data.index, recent_data['Price'], label='Historical Price', color='blue')
+            ax4.plot(recent_data.index, recent_data['Price'], label='Historical Price', color='blue', linewidth=2)
             
             # Plot future predictions
             ax4.plot(future_dates, future_prices, label=f'Future Forecast ({n_days} days)', 
-                    color='red', linestyle='--', marker='o', markersize=3)
+                    color='red', linestyle='--', marker='o', markersize=4, linewidth=2)
+            
+            # Add confidence band based on forecasted volatility
+            # Simple approximation: ±1.96 * volatility for 95% confidence
+            upper_bound = future_prices + 1.96 * np.array(future_vols) * future_prices
+            lower_bound = future_prices - 1.96 * np.array(future_vols) * future_prices
+            ax4.fill_between(future_dates, lower_bound, upper_bound, 
+                            color='red', alpha=0.2, label='95% Confidence Interval')
             
             # Add vertical line at present
-            ax4.axvline(x=data.index[-1], color='gray', linestyle='--', label='Present Day')
+            ax4.axvline(x=data.index[-1], color='gray', linestyle='--', linewidth=1.5, label='Present Day')
             
-            ax4.set_title(f'{ticker} Price Forecast')
-            ax4.set_xlabel('Date')
-            ax4.set_ylabel('Price')
-            ax4.legend()
-            ax4.grid(True)
+            ax4.set_title(f'{ticker} Price Forecast with Confidence Interval', fontsize=14, fontweight='bold')
+            ax4.set_xlabel('Date', fontsize=12)
+            ax4.set_ylabel('Price', fontsize=12)
+            ax4.legend(loc='best')
+            ax4.grid(True, alpha=0.3)
             st.pyplot(fig4)
             
             # Summary statistics
