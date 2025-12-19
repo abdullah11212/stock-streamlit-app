@@ -485,11 +485,22 @@ def main():
             
             # Normality tests in expander
             with st.expander("🔍 Normality Tests"):
-                st.write(f"**Kolmogorov-Smirnov Test:** D={stats_results['ks_D']:.5f}, p={stats_results['ks_p']:.5f}")
-                st.write(f"**Shapiro-Wilk Test:** stat={stats_results['shapiro_stat']:.5f}, p={stats_results['shapiro_p']:.5f}")
+                st.write(f"**Kolmogorov-Smirnov Test:** D={stats_results['ks_D']:.5f}, p={stats_results['ks_p']:.2e}")
+                st.write(f"**Shapiro-Wilk Test:** stat={stats_results['shapiro_stat']:.5f}, p={stats_results['shapiro_p']:.2e}")
                 st.write(f"**Anderson-Darling Test:** stat={stats_results['ad_statistic']:.5f}")
                 st.write(f"**AD Critical Values:** {stats_results['ad_critical_values']}")
                 st.write(f"**Normality Conclusion:** {stats_results['normality_conclusion']}")
+                
+                # Add interpretation
+                st.info("""
+                **Interpretation:** All tests strongly reject normality, which is expected for stock returns. 
+                Financial returns typically exhibit:
+                - Heavy tails (leptokurtic distribution)
+                - Skewness (asymmetric returns)
+                - Volatility clustering
+                
+                This justifies using the Heston stochastic volatility model instead of assuming constant volatility.
+                """)
             
             # Jump detection
             with st.expander("🎯 Jump Detection (3σ Rule)"):
